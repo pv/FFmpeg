@@ -826,6 +826,58 @@ static void copy_input_samples(AACEncContext *s, const AVFrame *frame)
     }
 }
 
+/**
+ * Finding zero of function f(x).
+ * The initial zero bracketing assumes f(x) is increasing.
+ */
+typedef struct FindZero {
+    int init;      ///< bitmask of whether x[0] (0x1) and x[1] (0x2) are valid
+    float x[2];    ///< zero of f(x) is in interval (x[0], x[1])
+    float f[2];    ///< interpolation values
+    int i;         ///< which x[i] is latest
+    float b;       ///< bracketing multiplier
+} FindZero;
+
+/** Return next x to evaluate f(x) at to approach the zero. */
+static float find_zero_next(FindZero *r, float x, float f)
+{
+    if (r->init != 0x3) {
+        /* Bracket the zero, assuming x > 0 and f(x) is increasing */
+        r->b = FFMIN(1.5f + 2 * r->b, 65536.0f);
+        if (f < 0) {
+            r->x[0] = x;
+            r->f[0] = f;
+            r->init |= 0x1;
+            if (r->init != 0x3)
+                return x * r->b;
+        } else {
+            r->x[1] = x;
+            r->f[1] = f;
+            r->init |= 0x2;
+            if (r->init != 0x3)
+                return x / r->b;
+        }
+        r->i = 1;
+    } else {
+        /* Anderson-Bjoerck false position method */
+        if ((f < 0) != (r->f[r->i] < 0)) {
+            r->i = !r->i;
+        } else {
+            float m = 1 - (float)f / r->f[r->i];
+
+            if (m <= 0)
+                m = 0.5f;
+
+            r->f[!r->i] *= m;
+        }
+
+        r->x[r->i] = x;
+        r->f[r->i] = f;
+    }
+
+    return (r->x[0] * r->f[1] - r->x[1] * r->f[0]) / (r->f[1] - r->f[0]);
+}
+
 static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                             const AVFrame *frame, int *got_packet_ptr)
 {
@@ -839,6 +891,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     int ms_mode = 0, is_mode = 0, tns_mode = 0, pred_mode = 0;
     int chan_el_counter[4];
     FFPsyWindowInfo windows[AAC_MAX_CHANNELS];
+    FindZero find_lambda = { 0 };
 
     /* add current frame to queue */
     if (frame) {
@@ -1100,32 +1153,58 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
          */
         frame_bits = put_bits_count(&s->pb);
         rate_bits = avctx->bit_rate * 1024 / avctx->sample_rate;
-        rate_bits = FFMIN(rate_bits, 6144 * s->channels - 3);
+        rate_bits = FFMIN(rate_bits, s->max_frame_bits);
         too_many_bits = FFMAX(target_bits, rate_bits);
-        too_many_bits = FFMIN(too_many_bits, 6144 * s->channels - 3);
+        too_many_bits = FFMIN(too_many_bits, s->max_frame_bits);
         too_few_bits = FFMIN(FFMAX(rate_bits - rate_bits/4, target_bits), too_many_bits);
-
-        /* When strict bit-rate control is demanded */
-        if (avctx->bit_rate_tolerance == 0) {
-            if (rate_bits < frame_bits) {
-                float ratio = ((float)rate_bits) / frame_bits;
-                s->lambda *= FFMIN(0.9f, ratio);
-                continue;
-            }
-            /* reset lambda when solution is found */
-            s->lambda = avctx->global_quality > 0 ? avctx->global_quality : 120;
-            break;
-        }
 
         /* When using ABR, be strict (but only for increasing) */
         too_few_bits = too_few_bits - too_few_bits/8;
         too_many_bits = too_many_bits + too_many_bits/2;
 
-        if (   its == 0 /* for steady-state Q-scale tracking */
-            || (its < 5 && (frame_bits < too_few_bits || frame_bits > too_many_bits))
-            || frame_bits >= 6144 * s->channels - 3  )
+        av_log(avctx, AV_LOG_TRACE,
+               "%08d: frame_bits:%d max:%d lambda:%f its:%d%s\n",
+               s->lambda_count, frame_bits, s->max_frame_bits, s->lambda, its,
+               (frame_bits > s->max_frame_bits) ? " BAD" : its ? " RETRY" : "");
+
+        if (frame_bits >= s->max_frame_bits || find_lambda.init) {
+            /* Search for lambda with frame_bits == rate_bits < max_frame_bits */
+            float lambda;
+            int value = frame_bits - rate_bits;
+            int value_max = s->max_frame_bits - rate_bits;
+
+            lambda = find_zero_next(&find_lambda, s->lambda, value);
+            lambda = av_clipf(lambda, FLT_EPSILON, 65536.f);
+
+            /* Close enough? */
+            if (value < value_max && (value > -rate_bits / 20 ||
+                                      value > too_few_bits - rate_bits ||
+                                      fabsf(lambda - s->lambda) < 0.05f * fabsf(lambda)))
+                break;
+
+            if (its > 10 || s->lambda == lambda) {
+                /* Not making enough progress, use whatever we have now. */
+                if (value < value_max)
+                    break;
+
+                if (!(find_lambda.init & 0x1)) {
+                    /* Could't find any lambda that gives a small enough frame.
+                     * Give up, produce the bad frame, and reset lambda for next.
+                     */
+                    s->lambda = avctx->global_quality > 0 ? avctx->global_quality : 120;
+                    break;
+                }
+
+                lambda = find_lambda.x[0];
+                memset(&find_lambda, 0, sizeof(find_lambda));
+            }
+
+            s->lambda = lambda;
+        } else if (   its == 0 /* for steady-state Q-scale tracking */
+                   || (its < 5 && (frame_bits < too_few_bits || frame_bits > too_many_bits)))
         {
             float ratio = ((float)rate_bits) / frame_bits;
+            float prev_lambda = s->lambda;
 
             if (frame_bits >= too_few_bits && frame_bits <= too_many_bits) {
                 /*
@@ -1142,24 +1221,27 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             }
             s->lambda = av_clipf(s->lambda * ratio, FLT_EPSILON, 65536.f);
 
-            /* Keep iterating if we must reduce and lambda is in the sky */
-            if (ratio > 0.9f && ratio < 1.1f) {
+            /* Give up if we're not making progress. */
+            if (s->lambda == prev_lambda)
                 break;
-            } else {
-                if (is_mode || ms_mode || tns_mode || pred_mode) {
-                    for (i = 0; i < s->chan_map[0]; i++) {
-                        // Must restore coeffs
-                        chans = tag == TYPE_CPE ? 2 : 1;
-                        cpe = &s->cpe[i];
-                        for (ch = 0; ch < chans; ch++)
-                            memcpy(cpe->ch[ch].coeffs, cpe->ch[ch].pcoeffs, sizeof(cpe->ch[ch].coeffs));
-                    }
-                }
-                its++;
-            }
+
+            /* Keep iterating if we must reduce and lambda is in the sky */
+            if (ratio > 0.9f && ratio < 1.1f)
+                break;
         } else {
             break;
         }
+
+        if (is_mode || ms_mode || tns_mode || pred_mode) {
+            for (i = 0; i < s->chan_map[0]; i++) {
+                // Must restore coeffs
+                chans = tag == TYPE_CPE ? 2 : 1;
+                cpe = &s->cpe[i];
+                for (ch = 0; ch < chans; ch++)
+                    memcpy(cpe->ch[ch].coeffs, cpe->ch[ch].pcoeffs, sizeof(cpe->ch[ch].coeffs));
+            }
+        }
+        its++;
     } while (1);
 
     if (s->options.ltp && s->coder->ltp_insert_new_frame)
@@ -1301,6 +1383,17 @@ static av_cold int aac_encode_init(AVCodecContext *avctx)
              6144 * s->channels);
     avctx->bit_rate = (int64_t)FFMIN(6144 * s->channels / 1024.0 * avctx->sample_rate,
                                      avctx->bit_rate);
+
+    /* Strict bitrate limiting (custom maximum bits per frame).
+     * Reduce target bitrate below the limit to avoid frequent re-encoding.
+     */
+    if (avctx->bit_rate_tolerance == 0) {
+        s->max_frame_bits = FFMAX(744 * s->channels - 3,
+                                  avctx->bit_rate * 1024 / avctx->sample_rate);
+        avctx->bit_rate = (int64_t)avctx->bit_rate * 85 / 100;
+    } else {
+        s->max_frame_bits = 6144 * s->channels - 3;
+    }
 
     /* Profile and option setting */
     avctx->profile = avctx->profile == AV_PROFILE_UNKNOWN ? AV_PROFILE_AAC_LOW :

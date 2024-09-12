@@ -228,6 +228,7 @@ typedef struct AACEncContext {
     int channels;                                ///< channel count
     const uint8_t *reorder_map;                  ///< lavc to aac reorder map
     const uint8_t *chan_map;                     ///< channel configuration map
+    int max_frame_bits;                          ///< maximum bits per frame (0=default)
 
     ChannelElement *cpe;                         ///< channel elements
     FFPsyContext psy;
