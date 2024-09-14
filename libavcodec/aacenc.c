@@ -890,6 +890,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     int target_bits, rate_bits, too_many_bits, too_few_bits;
     int ms_mode = 0, is_mode = 0, tns_mode = 0, pred_mode = 0;
     int chan_el_counter[4];
+    int psy_bitres_alloc[AAC_MAX_CHANNELS];
     FFPsyWindowInfo windows[AAC_MAX_CHANNELS];
     FindZero find_lambda = { 0 };
 
@@ -912,6 +913,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     start_ch = 0;
     for (i = 0; i < s->chan_map[0]; i++) {
         FFPsyWindowInfo* wi = windows + start_ch;
+        const float *coeffs[2];
         tag      = s->chan_map[i+1];
         chans    = tag == TYPE_CPE ? 2 : 1;
         cpe      = &s->cpe[i];
@@ -920,6 +922,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             float clip_avoidance_factor;
             sce = &cpe->ch[ch];
             ics = &sce->ics;
+            coeffs[ch] = sce->coeffs;
             s->cur_channel = start_ch + ch;
             overlap  = &samples[s->cur_channel][0];
             samples2 = overlap + 1024;
@@ -1002,6 +1005,12 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             }
             avoid_clipping(s, sce);
         }
+
+        s->psy.bitres.alloc = -1;
+        s->psy.bitres.bits = s->last_frame_pb_count / s->channels;
+        s->psy.model->analyze(&s->psy, start_ch, coeffs, wi);
+        psy_bitres_alloc[start_ch] = s->psy.bitres.alloc;
+
         start_ch += chans;
     }
     if ((ret = ff_alloc_packet(avctx, avpkt, 8192 * s->channels)) < 0)
@@ -1017,7 +1026,6 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         memset(chan_el_counter, 0, sizeof(chan_el_counter));
         for (i = 0; i < s->chan_map[0]; i++) {
             FFPsyWindowInfo* wi = windows + start_ch;
-            const float *coeffs[2];
             tag      = s->chan_map[i+1];
             chans    = tag == TYPE_CPE ? 2 : 1;
             cpe      = &s->cpe[i];
@@ -1028,7 +1036,6 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             put_bits(&s->pb, 4, chan_el_counter[tag]++);
             for (ch = 0; ch < chans; ch++) {
                 sce = &cpe->ch[ch];
-                coeffs[ch] = sce->coeffs;
                 sce->ics.predictor_present = 0;
                 sce->ics.ltp.present = 0;
                 memset(sce->ics.ltp.used, 0, sizeof(sce->ics.ltp.used));
@@ -1038,9 +1045,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                     if (sce->band_type[w] > RESERVED_BT)
                         sce->band_type[w] = 0;
             }
-            s->psy.bitres.alloc = -1;
-            s->psy.bitres.bits = s->last_frame_pb_count / s->channels;
-            s->psy.model->analyze(&s->psy, start_ch, coeffs, wi);
+            s->psy.bitres.alloc = psy_bitres_alloc[start_ch];
             if (s->psy.bitres.alloc > 0) {
                 /* Lambda unused here on purpose, we need to take psy's unscaled allocation */
                 target_bits += s->psy.bitres.alloc
