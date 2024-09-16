@@ -1242,8 +1242,10 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                 // Must restore coeffs
                 chans = tag == TYPE_CPE ? 2 : 1;
                 cpe = &s->cpe[i];
-                for (ch = 0; ch < chans; ch++)
+                for (ch = 0; ch < chans; ch++) {
                     memcpy(cpe->ch[ch].coeffs, cpe->ch[ch].pcoeffs, sizeof(cpe->ch[ch].coeffs));
+                    avoid_clipping(s, &cpe->ch[ch]);
+                }
             }
         }
         its++;
